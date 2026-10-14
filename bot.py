@@ -740,7 +740,7 @@ def build_app(token: str) -> Application:
 # ---------- 11. ISHGA TUSHIRISH ----------
 def ask_token() -> Optional[str]:
     for _ in range(3):
-        token = input("Bot tokenini kiriting (BotFather bergan): ").strip()
+        token = os.getenv("BOT_TOKEN","").strip()
         if TOKEN_RE.fullmatch(token):
             return token
         print("❌ Token formati noto‘g‘ri (masalan: 123456789:AAxxxxxxxx...). Qayta urinib ko‘ring.")
