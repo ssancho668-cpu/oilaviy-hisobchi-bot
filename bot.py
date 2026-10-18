@@ -1,95 +1,104 @@
+    if s == FAMILY: await family_report(update, u); return
+    if s == USERS: await users_list(update, u); return
+    if s == DEBT or s == CLAIM: return
+
+    f = context.user_data.get("flow")
+    if not f:
+        await msg.reply_text("Kerakli bo‘limni menyudan tanlang.", reply_markup=menu(u)); return
+    stage = f["stage"]
+    if stage == "amount":
+        n = amount_from(s)
+        if n is None:
+            await msg.reply_text("Summani musbat raqamda kiriting. Masalan: 250000"); return
+        f["amount"] = n
+        if f["kind"] == "income":
+            f["stage"] = "category"
+            await msg.reply_text("Daromad turini tanlang:", reply_markup=choice_menu(INCOME_CATS))
+        elif f["kind"] == "expense":
+            if f.get("forced"):
+                f["category"] = f["forced"]; f["stage"] = "note"
+                await msg.reply_text("Izoh yozing yoki o‘tkazib yuboring:", reply_markup=choice_menu([SKIP]))
+            else:
+                f["stage"] = "category"
+                await msg.reply_text("Xarajat kategoriyasini tanlang:", reply_markup=choice_menu(EXPENSE_CATS))
+        else:
+            f["stage"] = "person"
+            await msg.reply_text("Shaxsning ismini kiriting:")
+        return
+    if stage == "category":
+        cats = INCOME_CATS if f["kind"] == "income" else EXPENSE_CATS
+        if s not in cats:
+            await msg.reply_text("Ro‘yxatdan kategoriyani tanlang:", reply_markup=choice_menu(cats)); return
+        f["category"] = s; f["stage"] = "note"
+        await msg.reply_text("Izoh yozing yoki o‘tkazib yuboring:", reply_markup=choice_menu([SKIP])); return
+    if stage == "person":
+        if len(s) < 2:
+            await msg.reply_text("Ismni kiriting (kamida 2 ta belgi)."); return
+        f["person"] = s[:100]; f["stage"] = "note"
+        await msg.reply_text("Izoh yozing yoki o‘tkazib yuboring:", reply_markup=choice_menu([SKIP])); return
     if stage == "note":
-        note = "" if text == B_SKIP else text[:200]
+        note = "" if s == SKIP else s[:200]
         try:
             with db() as c:
-                if flow["kind"] in ("income","expense"):
-                    c.execute("""INSERT INTO transactions(op_id,user_id,type,amount,category,note,date)
-                                 VALUES(?,?,?,?,?,?,?)""",
-                              (flow["op_id"],user.id,flow["kind"],flow["amount"],
-                               flow["category"],note,datetime.now(TZ).date().isoformat()))
+                if f["kind"] in ("income", "expense"):
+                    c.execute("INSERT INTO transactions(user_id,type,amount,category,note,created_at) VALUES(?,?,?,?,?,?)",
+                              (u.id, f["kind"], f["amount"], f["category"], note, now()))
                 else:
-                    c.execute("""INSERT INTO obligations(user_id,kind,amount,person,note,status,created_at)
-                                 VALUES(?,?,?,?,?,'open',?)""",
-                              (user.id,flow["kind"],flow["amount"],flow["person"],note,now_str()))
+                    c.execute("INSERT INTO obligations(user_id,kind,amount,person,note,status,created_at) VALUES(?,?,?,?,?,'open',?)",
+                              (u.id, f["kind"], f["amount"], f["person"], note, now()))
         except sqlite3.Error:
-            logger.exception("Database save error")
-            await update.message.reply_text("Saqlashda xato yuz berdi. Qayta urinib ko'ring.")
-            return
-        kind = flow["kind"]
-        amount_text = money(flow["amount"])
-        context.user_data.clear()
-        if kind in ("income","expense"):
-            await update.message.reply_text(
-                f"✅ Saqlandi!\nTuri: {'Daromad' if kind=='income' else 'Xarajat'}\n"
-                f"Summa: {amount_text}\nKategoriya: {flow['category']}\nIzoh: {note or '—'}",
-                reply_markup=keyboard(user))
+            log.exception("Database save error")
+            await msg.reply_text("Saqlashda xato yuz berdi. Qayta urinib ko‘ring."); return
+        kind, n, cat, person = f["kind"], f["amount"], f.get("category",""), f.get("person","")
+        context.user_data.pop("flow", None)
+        if kind in ("income", "expense"):
+            answer = f"✅ Saqlandi!\nTuri: {'Daromad' if kind=='income' else 'Xarajat'}\nSumma: {fmt(n)}\nKategoriya: {cat}\nIzoh: {note or '—'}"
         else:
-            await update.message.reply_text(
-                f"✅ {'Qarz' if kind=='debt' else 'Haq'} saqlandi!\nSumma: {amount_text}\n"
-                f"Shaxs: {flow['person']}\nIzoh: {note or '—'}",
-                reply_markup=keyboard(user))
-        return
+            answer = f"✅ {'Qarz' if kind=='debt' else 'Haq'} saqlandi!\nSumma: {fmt(n)}\nShaxs: {person}\nIzoh: {note or '—'}"
+        await msg.reply_text(answer, reply_markup=menu(u)); return
 
-async def obligations_list(update, user, kind):
-    with db() as c:
-        rows = c.execute("SELECT amount,person,note,status,created_at FROM obligations WHERE user_id=? AND kind=? ORDER BY id DESC LIMIT 30",
-                         (user.id,kind)).fetchall()
-    title = "📉 Qarzlarim" if kind == "debt" else "📈 Haqlarim"
-    if not rows:
-        await update.message.reply_text(f"{title}: hozircha yozuv yo'q.", reply_markup=keyboard(user))
-        return
-    lines=[title]
-    total=0
-    for r in rows:
-        total += r["amount"]
-        lines.append(f"\n• {money(r['amount'])} — {r['person']} ({r['status']})")
-        if r["note"]: lines.append(f"  Izoh: {r['note']}")
-    lines.append(f"\nJami: {money(total)}")
-    await update.message.reply_text("\n".join(lines), reply_markup=keyboard(user))
+    context.user_data.pop("flow", None)
+    await msg.reply_text("Jarayon bekor qilindi. Menyudan qayta tanlang.", reply_markup=menu(u))
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q:
-        return
     await q.answer()
-    user = q.from_user
-    if not is_admin(user):
-        await q.edit_message_text("⛔ Bu amal faqat administrator uchun.")
-        return
-    action, uid_text = q.data.split(":",1)
-    uid = int(uid_text)
+    if not admin(q.from_user):
+        await q.edit_message_text("⛔ Faqat administrator uchun."); return
+    try:
+        action, raw_id = q.data.split(":", 1); uid = int(raw_id)
+    except (ValueError, AttributeError):
+        await q.edit_message_text("So‘rov noto‘g‘ri."); return
+    if action not in ("approve", "reject"):
+        await q.edit_message_text("Amal topilmadi."); return
     with db() as c:
-        row = c.execute("SELECT status FROM users WHERE user_id=?", (uid,)).fetchone()
+        row = c.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone()
         if not row:
             await q.edit_message_text("Foydalanuvchi topilmadi."); return
         status = "approved" if action == "approve" else "rejected"
-        c.execute("UPDATE users SET status=? WHERE user_id=?", (status,uid))
-    await q.edit_message_text("✅ Foydalanuvchi tasdiqlandi." if action=="approve" else "⛔ So'rov rad etildi.")
+        c.execute("UPDATE users SET status=? WHERE user_id=?", (status, uid))
+    await q.edit_message_text("✅ Tasdiqlandi." if action == "approve" else "⛔ Rad etildi.")
     try:
-        await context.bot.send_message(uid,
-            "✅ Administrator sizni tasdiqladi. /start ni bosing." if action=="approve"
-            else "⛔ Botdan foydalanish so'rovingiz rad etildi.")
+        await context.bot.send_message(uid, "✅ Administrator tasdiqladi. /start bosing." if action=="approve" else "⛔ So‘rov rad etildi.")
     except Exception:
-        logger.warning("User notification failed for %s", uid)
+        log.warning("Foydalanuvchiga xabar yuborilmadi: %s", uid)
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎙 Ovozli xabar qabul qilindi, lekin ovozni matnga aylantirish xizmati ulanmagan. "
-        "Hozircha daromad/xarajatni matn bilan kiriting."
-    )
+    if await register_or_check(update, context):
+        await update.effective_message.reply_text("🎙 Ovozli xabar qabul qilindi, ammo ovozni matnga aylantirish xizmati ulanmagan. Hozircha matn bilan kiriting.")
 
-async def error_handler(update, context):
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, Conflict):
-        logger.error("Telegram Conflict: boshqa bot nusxasi ham ishlayapti. Boshqa nusxani to'xtating.")
+        log.error("Botning boshqa nusxasi ham ishlayapti. Boshqa nusxani to‘xtating.")
     elif isinstance(err, NetworkError):
-        logger.warning("Tarmoq xatosi: %s", type(err).__name__)
+        log.warning("Tarmoq xatosi: %s", type(err).__name__)
     else:
-        logger.exception("Kutilmagan bot xatosi", exc_info=err)
+        log.exception("Kutilmagan bot xatosi", exc_info=err)
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable o'rnatilmagan.")
+        raise RuntimeError("Render Environment'da BOT_TOKEN o‘rnatilmagan.")
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -99,12 +108,14 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE & filters.ChatType.PRIVATE, voice_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_text))
     app.add_error_handler(error_handler)
-    logger.info("Oilaviy Hisobchi bot ishga tushmoqda. DB: %s", DB_PATH)
+    log.info("Oilaviy Hisobchi ishga tushmoqda. DB: %s", DB_PATH)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 if __name__ == "__main__":
     try:
         main()
     except InvalidToken:
-        logger.error("BOT_TOKEN noto'g'ri. @BotFather tokenini tekshiring.")
+        log.error("BOT_TOKEN noto‘g‘ri. @BotFather tokenini tekshiring.")
         raise
+
+
