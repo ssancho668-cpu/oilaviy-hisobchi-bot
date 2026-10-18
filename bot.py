@@ -1,121 +1,96 @@
-    if s == FAMILY: await family_report(update, u); return
-    if s == USERS: await users_list(update, u); return
-    if s == DEBT or s == CLAIM: return
+# -*- coding: utf-8 -*-
+"""
+Oilaviy Hisobchi — Render Background Worker uchun.
+Environment variable: BOT_TOKEN (majburiy)
+Ixtiyoriy: ADMIN_ID (default: 1935206106), DATA_DIR (doimiy disk uchun /var/data)
+"""
+import logging
+import os
+import re
+import sqlite3
+import uuid
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 
-    f = context.user_data.get("flow")
-    if not f:
-        await msg.reply_text("Kerakli bo‘limni menyudan tanlang.", reply_markup=menu(u)); return
-    stage = f["stage"]
-    if stage == "amount":
-        n = amount_from(s)
-        if n is None:
-            await msg.reply_text("Summani musbat raqamda kiriting. Masalan: 250000"); return
-        f["amount"] = n
-        if f["kind"] == "income":
-            f["stage"] = "category"
-            await msg.reply_text("Daromad turini tanlang:", reply_markup=choice_menu(INCOME_CATS))
-        elif f["kind"] == "expense":
-            if f.get("forced"):
-                f["category"] = f["forced"]; f["stage"] = "note"
-                await msg.reply_text("Izoh yozing yoki o‘tkazib yuboring:", reply_markup=choice_menu([SKIP]))
-            else:
-                f["stage"] = "category"
-                await msg.reply_text("Xarajat kategoriyasini tanlang:", reply_markup=choice_menu(EXPENSE_CATS))
-        else:
-            f["stage"] = "person"
-            await msg.reply_text("Shaxsning ismini kiriting:")
-        return
-    if stage == "category":
-        cats = INCOME_CATS if f["kind"] == "income" else EXPENSE_CATS
-        if s not in cats:
-            await msg.reply_text("Ro‘yxatdan kategoriyani tanlang:", reply_markup=choice_menu(cats)); return
-        f["category"] = s; f["stage"] = "note"
-        await msg.reply_text("Izoh yozing yoki o‘tkazib yuboring:", reply_markup=choice_menu([SKIP])); return
-    if stage == "person":
-        if len(s) < 2:
-            await msg.reply_text("Ismni kiriting (kamida 2 ta belgi)."); return
-        f["person"] = s[:100]; f["stage"] = "note"
-        await msg.reply_text("Izoh yozing yoki o‘tkazib yuboring:", reply_markup=choice_menu([SKIP])); return
-    if stage == "note":
-        note = "" if s == SKIP else s[:200]
-        try:
-            with db() as c:
-                if f["kind"] in ("income", "expense"):
-                    c.execute("INSERT INTO transactions(user_id,type,amount,category,note,created_at) VALUES(?,?,?,?,?,?)",
-                              (u.id, f["kind"], f["amount"], f["category"], note, now()))
-                else:
-                    c.execute("INSERT INTO obligations(user_id,kind,amount,person,note,status,created_at) VALUES(?,?,?,?,?,'open',?)",
-                              (u.id, f["kind"], f["amount"], f["person"], note, now()))
-        except sqlite3.Error:
-            log.exception("Database save error")
-            await msg.reply_text("Saqlashda xato yuz berdi. Qayta urinib ko‘ring."); return
-        kind, n, cat, person = f["kind"], f["amount"], f.get("category",""), f.get("person","")
-        context.user_data.pop("flow", None)
-        if kind in ("income", "expense"):
-            answer = f"✅ Saqlandi!\nTuri: {'Daromad' if kind=='income' else 'Xarajat'}\nSumma: {fmt(n)}\nKategoriya: {cat}\nIzoh: {note or '—'}"
-        else:
-            answer = f"✅ {'Qarz' if kind=='debt' else 'Haq'} saqlandi!\nSumma: {fmt(n)}\nShaxs: {person}\nIzoh: {note or '—'}"
-        await msg.reply_text(answer, reply_markup=menu(u)); return
+from telegram import (
+    Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+)
+from telegram.error import Conflict, InvalidToken, NetworkError
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
 
-    context.user_data.pop("flow", None)
-    await msg.reply_text("Jarayon bekor qilindi. Menyudan qayta tanlang.", reply_markup=menu(u))
+# ---------- SETTINGS ----------
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1935206106"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CURRENCY = "so'm"
+TZ = timezone(timedelta(hours=5))
+DATA_DIR = os.getenv("DATA_DIR", "").strip()
+if DATA_DIR:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    DB_PATH = os.path.join(DATA_DIR, "oilaviy_hisobchi.db")
+else:
+    # Render doimiy disk ulanmagan bo'lsa, fayl qayta deployda yo'qolishi mumkin.
+    DB_PATH = os.getenv("DB_PATH", "oilaviy_hisobchi.db")
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not admin(q.from_user):
-        await q.edit_message_text("⛔ Faqat administrator uchun."); return
-    try:
-        action, raw_id = q.data.split(":", 1); uid = int(raw_id)
-    except (ValueError, AttributeError):
-        await q.edit_message_text("So‘rov noto‘g‘ri."); return
-    if action not in ("approve", "reject"):
-        await q.edit_message_text("Amal topilmadi."); return
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO")
+)
+logger = logging.getLogger("oilaviy_hisobchi")
+
+# ---------- BUTTONS ----------
+B_INCOME = "💰 Daromadlar"
+B_EXPENSE = "💸 Xarajatlar"
+B_EXTRA = "⚠️ Ortiqcha xarajatlar"
+B_DEBT = "📉 Qarzlarim"
+B_ADD_DEBT = "➕ Qarz qo‘shish"
+B_CLAIM = "📈 Haqlarim"
+B_ADD_CLAIM = "➕ Haq qo‘shish"
+B_BALANCE = "🏦 Balans"
+B_REPORT = "📊 Hisobot"
+B_FAMILY = "👨‍👩‍👦 Oilaviy hisobot"
+B_USERS = "👥 Foydalanuvchilar"
+B_CANCEL = "❌ Bekor qilish"
+B_SKIP = "⏭ O‘tkazib yuborish"
+B_APPROVE = "✅ Tasdiqlash so‘rovlari"
+MAIN_BUTTONS = {
+    B_INCOME, B_EXPENSE, B_EXTRA, B_DEBT, B_ADD_DEBT, B_CLAIM, B_ADD_CLAIM,
+    B_BALANCE, B_REPORT, B_FAMILY, B_USERS, B_APPROVE
+}
+INCOME_CATS = ["Maosh", "Biznes", "Sovg'a", "Boshqa daromad"]
+EXPENSE_CATS = ["Oziq-ovqat", "Mashina", "Kreditlar", "Kommunal",
+                "Kiyim-kechak", "Sog'liq", "Ta'lim", "Ko'ngil ochish",
+                "Ortiqcha xarajatlar", "Boshqa xarajat"]
+
+def now_str():
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+def init_db():
     with db() as c:
-        row = c.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone()
-        if not row:
-            await q.edit_message_text("Foydalanuvchi topilmadi."); return
-        status = "approved" if action == "approve" else "rejected"
-        c.execute("UPDATE users SET status=? WHERE user_id=?", (status, uid))
-    await q.edit_message_text("✅ Tasdiqlandi." if action == "approve" else "⛔ Rad etildi.")
-    try:
-        await context.bot.send_message(uid, "✅ Administrator tasdiqladi. /start bosing." if action=="approve" else "⛔ So‘rov rad etildi.")
-    except Exception:
-        log.warning("Foydalanuvchiga xabar yuborilmadi: %s", uid)
-
-async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await register_or_check(update, context):
-        await update.effective_message.reply_text("🎙 Ovozli xabar qabul qilindi, ammo ovozni matnga aylantirish xizmati ulanmagan. Hozircha matn bilan kiriting.")
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    err = context.error
-    if isinstance(err, Conflict):
-        log.error("Botning boshqa nusxasi ham ishlayapti. Boshqa nusxani to‘xtating.")
-    elif isinstance(err, NetworkError):
-        log.warning("Tarmoq xatosi: %s", type(err).__name__)
-    else:
-        log.exception("Kutilmagan bot xatosi", exc_info=err)
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Render Environment'da BOT_TOKEN o‘rnatilmagan.")
-    init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^(approve|reject):\d+$"))
-    app.add_handler(MessageHandler(filters.VOICE & filters.ChatType.PRIVATE, voice_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_text))
-    app.add_error_handler(error_handler)
-    log.info("Oilaviy Hisobchi ishga tushmoqda. DB: %s", DB_PATH)
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
-
-if __name__ == "__main__":
-    try:
-        main()
-    except InvalidToken:
-        log.error("BOT_TOKEN noto‘g‘ri. @BotFather tokenini tekshiring.")
-        raise
-
-
+        c.execute("""CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT NOT NULL DEFAULT '',
+            username TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS transactions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            op_id TEXT NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            type TEXT NOT NULL CHECK(type IN ('income','expense')),
+            amount INTEGER NOT NULL CHECK(amount > 0),
+            category TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            date TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(user_id)
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS obligations(
